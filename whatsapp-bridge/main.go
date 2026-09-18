@@ -86,6 +86,22 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- #278: without these indexes every list_messages / list_chats /
+		-- get_message_context / get_last_interaction call is a full-table
+		-- scan. Latency then scales linearly with history size. The three
+		-- messages indexes cover the hot filter+sort predicates; the chats
+		-- index covers the last-active ORDER BY in list_chats. All are
+		-- IF NOT EXISTS so an existing store gets them for free on first
+		-- start after the upgrade.
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_time
+			ON messages(chat_jid, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_sender_time
+			ON messages(sender, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+			ON messages(timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_message
+			ON chats(last_message_time DESC);
 	`)
 	if err != nil {
 		db.Close()
@@ -362,15 +378,64 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
-// SendMessageRequest represents the request body for the send message API
+// SendMessageRequest represents the request body for the send message API.
+// The Reply* fields (added for #121) are optional; when both are set the
+// outbound message quotes the referenced original in the recipient's chat.
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient        string `json:"recipient"`
+	Message          string `json:"message"`
+	MediaPath        string `json:"media_path,omitempty"`
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	ReplyToSenderJID string `json:"reply_to_sender_jid,omitempty"`
+}
+
+// validateMediaPath closes CWE-22 (Path Traversal) in /api/send by refusing
+// paths that contain ".." components and, if the WHATSAPP_MEDIA_ROOTS env
+// var is set, restricting reads to that colon-separated allowlist of
+// directories. Without the env var the historical behavior (accept any
+// absolute path the process can read) is preserved so existing users are
+// not broken - the ".." check alone blocks the CVE POC in #241.
+func validateMediaPath(mediaPath string) error {
+	if mediaPath == "" {
+		return fmt.Errorf("media_path is empty")
+	}
+	if strings.Contains(mediaPath, "..") {
+		return fmt.Errorf("media_path must not contain \"..\"")
+	}
+	roots := strings.Split(os.Getenv("WHATSAPP_MEDIA_ROOTS"), string(os.PathListSeparator))
+	if len(roots) == 0 || (len(roots) == 1 && roots[0] == "") {
+		return nil
+	}
+	abs, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return fmt.Errorf("bad media_path: %v", err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("cannot resolve media_path: %v", err)
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		rootReal, err := filepath.EvalSymlinks(rootAbs)
+		if err != nil {
+			rootReal = rootAbs
+		}
+		rootClean := filepath.Clean(rootReal)
+		if real == rootClean || strings.HasPrefix(real, rootClean+string(os.PathSeparator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("media_path is not under any WHATSAPP_MEDIA_ROOTS entry")
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToMessageID string, replyToSenderJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -400,6 +465,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// CWE-22 guard - refuse traversal paths and (optionally) enforce
+		// WHATSAPP_MEDIA_ROOTS before touching the filesystem.
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Refusing media_path: %v", err)
+		}
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -569,6 +639,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 	} else {
 		msg.Conversation = proto.String(message)
+	}
+
+	// #121: quote-reply support. A WhatsApp reply is a message that carries a
+	// ContextInfo{StanzaID, Participant} pointing at the original. For group
+	// replies, Participant is required and must be the original sender's JID;
+	// for direct chats it can be omitted. Building ExtendedTextMessage is
+	// necessary because Conversation cannot carry ContextInfo.
+	if replyToMessageID != "" {
+		ctxInfo := &waProto.ContextInfo{StanzaID: proto.String(replyToMessageID)}
+		if replyToSenderJID != "" {
+			ctxInfo.Participant = proto.String(replyToSenderJID)
+		}
+		if msg.ExtendedTextMessage != nil {
+			msg.ExtendedTextMessage.ContextInfo = ctxInfo
+		} else if msg.ImageMessage != nil {
+			msg.ImageMessage.ContextInfo = ctxInfo
+		} else if msg.VideoMessage != nil {
+			msg.VideoMessage.ContextInfo = ctxInfo
+		} else if msg.AudioMessage != nil {
+			msg.AudioMessage.ContextInfo = ctxInfo
+		} else if msg.DocumentMessage != nil {
+			msg.DocumentMessage.ContextInfo = ctxInfo
+		} else {
+			// Plain text - upgrade Conversation to ExtendedTextMessage so it
+			// can carry ContextInfo.
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: ctxInfo,
+			}
+			msg.Conversation = nil
+		}
 	}
 
 	// Send message
@@ -977,8 +1078,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (with optional reply-to context per #121)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToMessageID, req.ReplyToSenderJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1046,8 +1147,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server. Bind to loopback only — the REST API has no auth and
+	// will send WhatsApp messages from the linked account on behalf of any caller.
+	// Binding to all interfaces (":port") would expose send/read to anyone on the
+	// same LAN (home WiFi, café, hotel), so we restrict to 127.0.0.1. The MCP
+	// server connects via http://localhost:{port} (whatsapp-mcp-server/whatsapp.py),
+	// which works unchanged. To opt into LAN exposure, set BIND_ADDR=0.0.0.0.
+	bindAddr := os.Getenv("BIND_ADDR")
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddr, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -1199,8 +1309,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && existingName != jid.User {
+		// Chat already has a resolved name (not a bare JID/LID fallback), reuse it.
+		// Names equal to jid.User are stale fallbacks and get re-resolved below.
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -1259,14 +1370,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Prefer the richest display name available. LID-based chats
+		// ("<id>@lid") typically have an empty FullName but a populated
+		// PushName, so fall back through the available name fields before
+		// using the raw JID, which otherwise surfaces as a bare number.
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
+		switch {
+		case err == nil && contact.FullName != "":
 			name = contact.FullName
-		} else if sender != "" {
+		case err == nil && contact.PushName != "":
+			name = contact.PushName
+		case err == nil && contact.BusinessName != "":
+			name = contact.BusinessName
+		case sender != "":
 			// Fallback to sender
 			name = sender
-		} else {
+		default:
 			// Last fallback to JID
 			name = jid.User
 		}
