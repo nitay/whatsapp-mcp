@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -442,10 +443,47 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+
+		// Any other file type. Sending "application/octet-stream" made WhatsApp
+		// mobile render the attachment as an unnamed .bin file, so look the type
+		// up by extension and only fall back to the generic type if that fails.
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -511,8 +549,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			// FileName is what WhatsApp actually shows and what the recipient's
+			// download is named; without it the file arrives as "Untitled" or
+			// ".bin". filepath.Base handles both / and \ separators, so a
+			// Windows path keeps its real name too.
+			docName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(docName),
+				FileName:      proto.String(docName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
