@@ -29,6 +29,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -172,20 +173,185 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Extract text content from a message
+// unwrapMessage returns the message that actually carries the content.
+//
+// View-once, ephemeral and document-with-caption messages are envelopes: the
+// real Message sits one level down. Live events are already unwrapped by
+// whatsmeow, but history sync payloads are not, so without this a captioned
+// image in a disappearing-messages chat is stored as if it were empty.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	// Envelopes do nest (ephemeral wrapping view-once), but the chain is short.
+	// The bound is only there so a malformed payload cannot loop forever.
+	for i := 0; i < 4 && msg != nil; i++ {
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
+// extractPollCreation returns the poll in a message regardless of which
+// protocol revision it arrived as.
+//
+// WhatsApp has migrated polls through V2..V6. Reading only V1, as this used to,
+// silently drops every modern poll. Most variants carry the poll directly; V4
+// wraps it in a FutureProofMessage.
+func extractPollCreation(msg *waProto.Message) *waProto.PollCreationMessage {
+	if p := msg.GetPollCreationMessage(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV2(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV3(); p != nil {
+		return p
+	}
+	if fp := msg.GetPollCreationMessageV4(); fp != nil {
+		if p := fp.GetMessage().GetPollCreationMessage(); p != nil {
+			return p
+		}
+	}
+	if p := msg.GetPollCreationMessageV5(); p != nil {
+		return p
+	}
+	return msg.GetPollCreationMessageV6()
+}
+
+// Extract text content from a message.
+//
+// Two classes of message used to come out of here empty, and StoreMessage drops
+// a message whose content and mediaType are both empty — while StoreChat had
+// already bumped chats.last_message_time, so a chat could look active while
+// holding no row for that activity:
+//
+//   - Media captions. A caption is text, not decoration: when someone sends a
+//     screenshot and types what to do with it underneath, the caption IS the
+//     message. Storing it as empty content is indistinguishable from an image
+//     sent with no words at all.
+//   - Everything that is not a plain text message — reactions, polls,
+//     locations, contact cards, edits, deletions, stickers. These get a short
+//     rendered text form instead. The prefixes are bracketed and stable so
+//     downstream consumers can recognise them without parsing free text.
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text first — the common case.
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions. Audio has no caption field in the protocol.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
+	if r := msg.GetReactionMessage(); r != nil {
+		if t := r.GetText(); t != "" {
+			return fmt.Sprintf("[reaction: %s]", t)
+		}
+		return "[reaction removed]"
+	}
+
+	if p := extractPollCreation(msg); p != nil {
+		opts := make([]string, 0, len(p.GetOptions()))
+		for _, o := range p.GetOptions() {
+			if n := o.GetOptionName(); n != "" {
+				opts = append(opts, n)
+			}
+		}
+		if len(opts) > 0 {
+			return fmt.Sprintf("[poll: %s — options: %s]", p.GetName(), strings.Join(opts, " | "))
+		}
+		return fmt.Sprintf("[poll: %s]", p.GetName())
+	}
+
+	if msg.GetPollUpdateMessage() != nil {
+		// The vote itself is encrypted; record that a vote happened.
+		return "[poll vote]"
+	}
+
+	if l := msg.GetLocationMessage(); l != nil {
+		if n := l.GetName(); n != "" {
+			return fmt.Sprintf("[location: %s (%.6f, %.6f)]", n, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if l := msg.GetLiveLocationMessage(); l != nil {
+		if c := l.GetCaption(); c != "" {
+			return fmt.Sprintf("[live location: %s (%.6f, %.6f)]", c, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[live location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if c := msg.GetContactMessage(); c != nil {
+		return fmt.Sprintf("[contact: %s]", c.GetDisplayName())
+	}
+
+	if ca := msg.GetContactsArrayMessage(); ca != nil {
+		names := make([]string, 0, len(ca.GetContacts()))
+		for _, c := range ca.GetContacts() {
+			if n := c.GetDisplayName(); n != "" {
+				names = append(names, n)
+			}
+		}
+		return fmt.Sprintf("[contacts: %s]", strings.Join(names, ", "))
+	}
+
+	// An edit can arrive as a top-level EditedMessage rather than wrapped in a
+	// ProtocolMessage, depending on the sending client's version.
+	if e := msg.GetEditedMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return fmt.Sprintf("[edited] %s", inner)
+		}
+		return "[edited message]"
+	}
+
+	// Edits and deletions otherwise arrive as ProtocolMessage. An edit carries
+	// the new message, so recurse into it rather than losing the corrected text.
+	if p := msg.GetProtocolMessage(); p != nil {
+		switch p.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			if inner := extractTextContent(p.GetEditedMessage()); inner != "" {
+				return fmt.Sprintf("[edited] %s", inner)
+			}
+			return "[edited message]"
+		case waProto.ProtocolMessage_REVOKE:
+			return "[message deleted]"
+		}
+	}
+
+	// Stickers carry no text; extractMediaInfo does not handle them as media
+	// either, so give them content so they are not silently dropped.
+	if msg.GetStickerMessage() != nil {
+		return "[sticker]"
+	}
+
 	return ""
 }
 
@@ -373,6 +539,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	// Same envelopes as in extractTextContent: a document sent with a caption
+	// arrives as DocumentWithCaptionMessage, and without unwrapping it would be
+	// stored as a message with no attachment at all.
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
@@ -426,11 +596,44 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Edits (and some other updates) can arrive as an opaque
+	// secretEncryptedMessage envelope rather than as EditedMessage or
+	// ProtocolMessage. Decrypt it and re-extract from the inner message.
+	// msg.IsEdit is set by whatsmeow when the payload was an edit.
+	if content == "" && msg.Message.GetSecretEncryptedMessage() != nil {
+		if inner, err := client.DecryptSecretEncryptedMessage(context.Background(), msg); err != nil {
+			logger.Warnf("Failed to decrypt secretEncryptedMessage %s: %v", msg.Info.ID, err)
+		} else if decrypted := extractTextContent(inner); decrypted != "" {
+			if msg.IsEdit {
+				content = fmt.Sprintf("[edited] %s", decrypted)
+			} else {
+				content = decrypted
+			}
+		}
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media.
+	//
+	// This gate is where unhandled message types disappear, and it used to do so
+	// invisibly: the "→"/"←" log line below only prints for messages that get
+	// stored, so a type extractTextContent does not understand left no trace at
+	// all. Log the populated proto fields before returning, so an unrecognised
+	// type is discoverable instead of silently lost.
 	if content == "" && mediaType == "" {
+		if msg.Message != nil {
+			var fields []string
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+				fields = append(fields, string(fd.Name()))
+				return true
+			})
+			if len(fields) > 0 {
+				logger.Warnf("Dropping message %s in %s: no text or media extracted. Populated fields: %s",
+					msg.Info.ID, chatJID, strings.Join(fields, ", "))
+			}
+		}
 		return
 	}
 
@@ -1078,15 +1281,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Extract text content through the same path as live messages.
+				// Duplicating the extraction here meant captions and non-text
+				// messages were dropped only for history-synced messages, which
+				// is the harder half of the bug to notice.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
