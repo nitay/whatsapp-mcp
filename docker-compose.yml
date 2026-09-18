@@ -1,0 +1,58 @@
+# Compose manages the bridge only — it is the long-running half that holds the
+# WhatsApp session. The MCP server is spawned over stdio by your MCP client, so
+# it cannot be a compose service; its image is built here under the "tools"
+# profile and then run with `docker run -i`. See the README.
+
+services:
+  whatsapp-bridge:
+    build:
+      context: ./whatsapp-bridge
+    image: whatsapp-mcp/bridge:local
+    container_name: whatsapp-bridge
+    restart: unless-stopped
+
+    # First run prints a QR code to scan with your phone. Without a TTY the
+    # half-block characters it draws are mangled, so keep one attached:
+    #   docker compose up        (foreground, QR visible)
+    stdin_open: true
+    tty: true
+
+    networks:
+      - whatsapp
+
+    # Bound to 127.0.0.1 on the host on purpose. The API has no authentication
+    # and will send messages from the linked account for any caller, so it must
+    # not be reachable from the LAN. Inside the container it still listens on
+    # 0.0.0.0 (set in the Dockerfile) so the MCP server container can reach it.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # A bind mount, not a named volume, and deliberately so: download_media
+    # reports the path of the file *inside* the container, and you need to be
+    # able to open it. ./store/<chat-jid>/<file> on the host is the same file as
+    # the /data/store/<chat-jid>/<file> the tool hands back.
+    volumes:
+      - ./store:/data/store
+      # Uncomment to let send_file read files from a host directory. The bridge
+      # can only send what is mounted into it.
+      # - ${WHATSAPP_OUTBOX:-./outbox}:/data/outbox:ro
+
+  # Not started by `docker compose up` — it exists so that
+  # `docker compose --profile tools build` produces the image your MCP client
+  # runs. Running it under compose would leave it idle with no stdio peer.
+  whatsapp-mcp-server:
+    profiles: ["tools"]
+    build:
+      context: ./whatsapp-mcp-server
+    image: whatsapp-mcp/server:local
+    networks:
+      - whatsapp
+    volumes:
+      - ./store:/data/store:ro
+
+networks:
+  whatsapp:
+    # Named explicitly so the network is "whatsapp-mcp" no matter what the
+    # checkout directory is called. The `docker run` command in the README
+    # joins it by this name.
+    name: whatsapp-mcp

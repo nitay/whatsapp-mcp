@@ -1,0 +1,7 @@
+# Never bake a session or message history into an image.
+store/
+*.db
+whatsapp-bridge
+whatsapp-client
+Dockerfile
+.dockerignore

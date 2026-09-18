@@ -10,10 +10,18 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Defaults assume the bridge runs from a sibling checkout directory, which is
+# the case when both halves are started by hand. Each is overridable by
+# environment variable so the MCP server can also run in a container, where the
+# bridge is a different host and its store is mounted at a different path.
+WHATSAPP_STORE_DIR = os.environ.get(
+    "WHATSAPP_STORE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store'),
+)
+MESSAGES_DB_PATH = os.environ.get("WHATSAPP_MESSAGES_DB", os.path.join(WHATSAPP_STORE_DIR, 'messages.db'))
 # The whatsmeow session store; holds the LID <-> phone-number mapping.
-WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_DB_PATH = os.environ.get("WHATSAPP_SESSION_DB", os.path.join(WHATSAPP_STORE_DIR, 'whatsapp.db'))
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api").rstrip("/")
 
 @dataclass
 class Message:

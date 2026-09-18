@@ -10,3 +10,7 @@ whatsapp-bridge/whatsapp-bridge
 # Downloaded chat media. *.db already covers the databases, but
 # store/<JID>/ holds personal photos, audio and documents.
 whatsapp-bridge/store/
+
+# Docker compose bind-mounts the bridge store here (see docker-compose.yml).
+/store/
+/outbox/

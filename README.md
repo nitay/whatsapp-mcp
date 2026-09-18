@@ -106,6 +106,77 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+### Running with Docker
+
+Two images: the bridge (a long-running service) and the MCP server. They are
+started differently, because the MCP server is not a service — it speaks
+JSON-RPC over stdin/stdout and is launched by your MCP client, once per session.
+
+**1. Build both images and start the bridge**
+
+```bash
+docker compose --profile tools build     # builds bridge + MCP server images
+docker compose up                        # foreground, so you can see the QR code
+```
+
+Scan the QR code with WhatsApp on your phone (Settings > Linked Devices). The
+session persists in `./store`, so later starts need no QR. Once paired you can
+background it with `docker compose up -d`.
+
+**2. Point your MCP client at the server image**
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "--network", "whatsapp-mcp",
+        "-v", "{{PATH_TO_SRC}}/whatsapp-mcp/store:/data/store:ro",
+        "whatsapp-mcp/server:local"
+      ]
+    }
+  }
+}
+```
+
+`-i` is required — without it the container gets no stdin and the MCP handshake
+never completes. `--network whatsapp-mcp` is what lets the server resolve the
+bridge by hostname.
+
+#### Why the MCP server needs both a volume and the network
+
+`whatsapp.py` reads `messages.db` **directly from disk** for every read tool and
+only calls the bridge's REST API for `send_message`, `send_file`,
+`send_audio_message` and `download_media`. So the container needs the store
+mounted *and* a route to the bridge. Mount the store read-only: only the bridge
+should write to it.
+
+#### Configuration
+
+| Variable | Used by | Default in image | Purpose |
+| --- | --- | --- | --- |
+| `BIND_ADDR` | bridge | `0.0.0.0` | Must be `0.0.0.0` *inside* a container or nothing can reach the API. Host exposure is restricted separately, by publishing the port to `127.0.0.1` only. |
+| `WHATSAPP_STORE_DIR` | MCP server | `/data/store` | Directory holding `messages.db` and `whatsapp.db`. |
+| `WHATSAPP_MESSAGES_DB` / `WHATSAPP_SESSION_DB` | MCP server | derived | Override an individual database path. |
+| `WHATSAPP_API_BASE_URL` | MCP server | `http://whatsapp-bridge:8080/api` | Where the bridge's REST API lives. |
+
+#### Things to know
+
+- **`CGO_ENABLED=1` is mandatory** for the bridge, and its absence is not a
+  build error. `go-sqlite3` is a cgo wrapper; built without cgo it silently
+  swaps in a stub that fails at the first query. The Dockerfile sets it and
+  installs the C toolchain.
+- **`download_media` reports container paths.** It returns
+  `/data/store/<chat-jid>/<file>`, which is `./store/<chat-jid>/<file>` on your
+  host — the same file through the bind mount, but the path string will not
+  resolve as-is outside the container.
+- **`send_file` can only read what is mounted.** Uncomment the `outbox` mount in
+  `docker-compose.yml` to give the bridge a host directory to send from.
+- **Never publish port 8080 beyond loopback.** The API has no authentication and
+  will send WhatsApp messages from your linked account for any caller.
+
 ## Architecture Overview
 
 This application consists of two main components:
