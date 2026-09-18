@@ -1,4 +1,7 @@
 import sqlite3
+# stdout is the MCP JSON-RPC transport (main.py runs mcp.run(transport='stdio')),
+# so every diagnostic in this module must be written to stderr instead.
+import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -8,6 +11,8 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# The whatsmeow session store; holds the LID <-> phone-number mapping.
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -85,7 +90,7 @@ def get_sender_name(sender_jid: str) -> str:
             return sender_jid
         
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        print(f"Database error while getting sender name: {e}", file=sys.stderr)
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -108,7 +113,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
+        print(f"Error formatting message: {e}", file=sys.stderr)
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
@@ -216,7 +221,7 @@ def list_messages(
         return format_messages_list(result, show_chat_info=True)    
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -309,7 +314,7 @@ def get_message_context(
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         raise
     finally:
         if 'conn' in locals():
@@ -328,24 +333,49 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
+        # The last-message columns only exist once the messages table is
+        # joined. Selecting them without the join made every call with
+        # include_last_message=False fail with "no such column" and return an
+        # empty list, so substitute NULL placeholders to keep the column count
+        # and order identical for the Chat construction below.
+        if include_last_message:
+            last_message_columns = """
                 messages.content as last_message,
                 messages.sender as last_sender,
                 messages.is_from_me as last_is_from_me
+            """
+        else:
+            last_message_columns = """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me
+            """
+
+        # Build base query
+        query_parts = [f"""
+            SELECT
+                chats.jid,
+                chats.name,
+                chats.last_message_time,
+                {last_message_columns}
             FROM chats
         """]
-        
+
         if include_last_message:
+            # Join the chat's actual newest message by rowid rather than by
+            # chats.last_message_time = messages.timestamp: that equality drops
+            # chats whose two columns have drifted, and duplicates a chat row
+            # whenever two of its messages share a timestamp.
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
+                LEFT JOIN messages ON messages.rowid = (
+                    SELECT rowid FROM messages
+                    WHERE chat_jid = chats.jid
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
             """)
-            
+
+
         where_clauses = []
         params = []
         
@@ -383,7 +413,7 @@ def list_chats(
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -425,7 +455,7 @@ def search_contacts(query: str) -> List[Contact]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -476,7 +506,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return []
     finally:
         if 'conn' in locals():
@@ -525,7 +555,7 @@ def get_last_interaction(jid: str) -> str:
         return format_message(message)
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
@@ -538,23 +568,42 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
-                c.jid,
-                c.name,
-                c.last_message_time,
+        # See list_chats: the last-message columns require the join, so fall
+        # back to NULL placeholders when it is omitted.
+        if include_last_message:
+            last_message_columns = """
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
+            """
+        else:
+            last_message_columns = """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me
+            """
+
+        query = f"""
+            SELECT
+                c.jid,
+                c.name,
+                c.last_message_time,
+                {last_message_columns}
             FROM chats c
         """
-        
+
         if include_last_message:
+            # rowid subquery instead of timestamp equality; see list_chats.
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+                LEFT JOIN messages m ON m.rowid = (
+                    SELECT rowid FROM messages
+                    WHERE chat_jid = c.jid
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
             """
-            
+
+
         query += " WHERE c.jid = ?"
         
         cursor.execute(query, (chat_jid,))
@@ -573,10 +622,36 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
+            conn.close()
+
+
+def _lids_for_phone(phone_number: str) -> List[str]:
+    """Return any LID identifiers mapped to the given phone number.
+
+    A direct chat may be keyed by a WhatsApp LID (e.g. "12345@lid") instead of
+    the phone JID, in which case the phone number never appears in chats.jid at
+    all. The LID <-> phone mapping lives in the bridge's whatsmeow session store
+    (whatsmeow_lid_map). Returns an empty list if that store or table is absent.
+    """
+    if not os.path.exists(WHATSAPP_DB_PATH):
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT lid FROM whatsmeow_lid_map WHERE pn LIKE ?",
+            (f"%{phone_number}%",),
+        )
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn:
             conn.close()
 
 
@@ -585,9 +660,16 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
+
+        # Match the phone JID ("<number>@s.whatsapp.net") as well as any LID
+        # ("<lid>@lid") mapped to the same number, so LID-keyed chats are found.
+        patterns = [f"%{sender_phone_number}%"]
+        patterns += [f"%{lid}%" for lid in _lids_for_phone(sender_phone_number)]
+        jid_filter = " OR ".join("c.jid LIKE ?" for _ in patterns)
+
+        # rowid subquery instead of timestamp equality; see list_chats.
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -595,12 +677,17 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            LEFT JOIN messages m ON m.rowid = (
+                SELECT rowid FROM messages
+                WHERE chat_jid = c.jid
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )
+            WHERE ({jid_filter}) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
-        
+        """, patterns)
+
         chat_data = cursor.fetchone()
         
         if not chat_data:
@@ -616,24 +703,37 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         return None
     finally:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(
+    recipient: str,
+    message: str,
+    reply_to_message_id: Optional[str] = None,
+    reply_to_sender_jid: Optional[str] = None,
+) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        # Quote-reply to an existing message. sender_jid is required for group
+        # replies (WhatsApp needs to know whose message is being quoted); for
+        # direct chats the field is optional.
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+        if reply_to_sender_jid:
+            payload["reply_to_sender_jid"] = reply_to_sender_jid
+
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful
@@ -747,21 +847,21 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                print(f"Media downloaded successfully: {path}", file=sys.stderr)
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
             return None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        print(f"Request error: {str(e)}", file=sys.stderr)
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        print(f"Error parsing response: {response.text}", file=sys.stderr)
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print(f"Unexpected error: {str(e)}", file=sys.stderr)
         return None

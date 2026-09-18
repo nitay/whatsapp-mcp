@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -84,6 +86,22 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- #278: without these indexes every list_messages / list_chats /
+		-- get_message_context / get_last_interaction call is a full-table
+		-- scan. Latency then scales linearly with history size. The three
+		-- messages indexes cover the hot filter+sort predicates; the chats
+		-- index covers the last-active ORDER BY in list_chats. All are
+		-- IF NOT EXISTS so an existing store gets them for free on first
+		-- start after the upgrade.
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_time
+			ON messages(chat_jid, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_sender_time
+			ON messages(sender, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+			ON messages(timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_message
+			ON chats(last_message_time DESC);
 	`)
 	if err != nil {
 		db.Close()
@@ -172,20 +190,185 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Extract text content from a message
+// unwrapMessage returns the message that actually carries the content.
+//
+// View-once, ephemeral and document-with-caption messages are envelopes: the
+// real Message sits one level down. Live events are already unwrapped by
+// whatsmeow, but history sync payloads are not, so without this a captioned
+// image in a disappearing-messages chat is stored as if it were empty.
+func unwrapMessage(msg *waProto.Message) *waProto.Message {
+	// Envelopes do nest (ephemeral wrapping view-once), but the chain is short.
+	// The bound is only there so a malformed payload cannot loop forever.
+	for i := 0; i < 4 && msg != nil; i++ {
+		switch {
+		case msg.GetEphemeralMessage().GetMessage() != nil:
+			msg = msg.GetEphemeralMessage().GetMessage()
+		case msg.GetViewOnceMessage().GetMessage() != nil:
+			msg = msg.GetViewOnceMessage().GetMessage()
+		case msg.GetViewOnceMessageV2().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2().GetMessage()
+		case msg.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			msg = msg.GetViewOnceMessageV2Extension().GetMessage()
+		case msg.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			msg = msg.GetDocumentWithCaptionMessage().GetMessage()
+		default:
+			return msg
+		}
+	}
+	return msg
+}
+
+// extractPollCreation returns the poll in a message regardless of which
+// protocol revision it arrived as.
+//
+// WhatsApp has migrated polls through V2..V6. Reading only V1, as this used to,
+// silently drops every modern poll. Most variants carry the poll directly; V4
+// wraps it in a FutureProofMessage.
+func extractPollCreation(msg *waProto.Message) *waProto.PollCreationMessage {
+	if p := msg.GetPollCreationMessage(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV2(); p != nil {
+		return p
+	}
+	if p := msg.GetPollCreationMessageV3(); p != nil {
+		return p
+	}
+	if fp := msg.GetPollCreationMessageV4(); fp != nil {
+		if p := fp.GetMessage().GetPollCreationMessage(); p != nil {
+			return p
+		}
+	}
+	if p := msg.GetPollCreationMessageV5(); p != nil {
+		return p
+	}
+	return msg.GetPollCreationMessageV6()
+}
+
+// Extract text content from a message.
+//
+// Two classes of message used to come out of here empty, and StoreMessage drops
+// a message whose content and mediaType are both empty — while StoreChat had
+// already bumped chats.last_message_time, so a chat could look active while
+// holding no row for that activity:
+//
+//   - Media captions. A caption is text, not decoration: when someone sends a
+//     screenshot and types what to do with it underneath, the caption IS the
+//     message. Storing it as empty content is indistinguishable from an image
+//     sent with no words at all.
+//   - Everything that is not a plain text message — reactions, polls,
+//     locations, contact cards, edits, deletions, stickers. These get a short
+//     rendered text form instead. The prefixes are bracketed and stable so
+//     downstream consumers can recognise them without parsing free text.
 func extractTextContent(msg *waProto.Message) string {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text first — the common case.
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions. Audio has no caption field in the protocol.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
+	if r := msg.GetReactionMessage(); r != nil {
+		if t := r.GetText(); t != "" {
+			return fmt.Sprintf("[reaction: %s]", t)
+		}
+		return "[reaction removed]"
+	}
+
+	if p := extractPollCreation(msg); p != nil {
+		opts := make([]string, 0, len(p.GetOptions()))
+		for _, o := range p.GetOptions() {
+			if n := o.GetOptionName(); n != "" {
+				opts = append(opts, n)
+			}
+		}
+		if len(opts) > 0 {
+			return fmt.Sprintf("[poll: %s — options: %s]", p.GetName(), strings.Join(opts, " | "))
+		}
+		return fmt.Sprintf("[poll: %s]", p.GetName())
+	}
+
+	if msg.GetPollUpdateMessage() != nil {
+		// The vote itself is encrypted; record that a vote happened.
+		return "[poll vote]"
+	}
+
+	if l := msg.GetLocationMessage(); l != nil {
+		if n := l.GetName(); n != "" {
+			return fmt.Sprintf("[location: %s (%.6f, %.6f)]", n, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if l := msg.GetLiveLocationMessage(); l != nil {
+		if c := l.GetCaption(); c != "" {
+			return fmt.Sprintf("[live location: %s (%.6f, %.6f)]", c, l.GetDegreesLatitude(), l.GetDegreesLongitude())
+		}
+		return fmt.Sprintf("[live location: %.6f, %.6f]", l.GetDegreesLatitude(), l.GetDegreesLongitude())
+	}
+
+	if c := msg.GetContactMessage(); c != nil {
+		return fmt.Sprintf("[contact: %s]", c.GetDisplayName())
+	}
+
+	if ca := msg.GetContactsArrayMessage(); ca != nil {
+		names := make([]string, 0, len(ca.GetContacts()))
+		for _, c := range ca.GetContacts() {
+			if n := c.GetDisplayName(); n != "" {
+				names = append(names, n)
+			}
+		}
+		return fmt.Sprintf("[contacts: %s]", strings.Join(names, ", "))
+	}
+
+	// An edit can arrive as a top-level EditedMessage rather than wrapped in a
+	// ProtocolMessage, depending on the sending client's version.
+	if e := msg.GetEditedMessage(); e != nil {
+		if inner := extractTextContent(e.GetMessage()); inner != "" {
+			return fmt.Sprintf("[edited] %s", inner)
+		}
+		return "[edited message]"
+	}
+
+	// Edits and deletions otherwise arrive as ProtocolMessage. An edit carries
+	// the new message, so recurse into it rather than losing the corrected text.
+	if p := msg.GetProtocolMessage(); p != nil {
+		switch p.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			if inner := extractTextContent(p.GetEditedMessage()); inner != "" {
+				return fmt.Sprintf("[edited] %s", inner)
+			}
+			return "[edited message]"
+		case waProto.ProtocolMessage_REVOKE:
+			return "[message deleted]"
+		}
+	}
+
+	// Stickers carry no text; extractMediaInfo does not handle them as media
+	// either, so give them content so they are not silently dropped.
+	if msg.GetStickerMessage() != nil {
+		return "[sticker]"
+	}
+
 	return ""
 }
 
@@ -195,15 +378,64 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
-// SendMessageRequest represents the request body for the send message API
+// SendMessageRequest represents the request body for the send message API.
+// The Reply* fields (added for #121) are optional; when both are set the
+// outbound message quotes the referenced original in the recipient's chat.
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient        string `json:"recipient"`
+	Message          string `json:"message"`
+	MediaPath        string `json:"media_path,omitempty"`
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	ReplyToSenderJID string `json:"reply_to_sender_jid,omitempty"`
+}
+
+// validateMediaPath closes CWE-22 (Path Traversal) in /api/send by refusing
+// paths that contain ".." components and, if the WHATSAPP_MEDIA_ROOTS env
+// var is set, restricting reads to that colon-separated allowlist of
+// directories. Without the env var the historical behavior (accept any
+// absolute path the process can read) is preserved so existing users are
+// not broken - the ".." check alone blocks the CVE POC in #241.
+func validateMediaPath(mediaPath string) error {
+	if mediaPath == "" {
+		return fmt.Errorf("media_path is empty")
+	}
+	if strings.Contains(mediaPath, "..") {
+		return fmt.Errorf("media_path must not contain \"..\"")
+	}
+	roots := strings.Split(os.Getenv("WHATSAPP_MEDIA_ROOTS"), string(os.PathListSeparator))
+	if len(roots) == 0 || (len(roots) == 1 && roots[0] == "") {
+		return nil
+	}
+	abs, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return fmt.Errorf("bad media_path: %v", err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("cannot resolve media_path: %v", err)
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		rootReal, err := filepath.EvalSymlinks(rootAbs)
+		if err != nil {
+			rootReal = rootAbs
+		}
+		rootClean := filepath.Clean(rootReal)
+		if real == rootClean || strings.HasPrefix(real, rootClean+string(os.PathSeparator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("media_path is not under any WHATSAPP_MEDIA_ROOTS entry")
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToMessageID string, replyToSenderJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -233,6 +465,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// CWE-22 guard - refuse traversal paths and (optionally) enforce
+		// WHATSAPP_MEDIA_ROOTS before touching the filesystem.
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Refusing media_path: %v", err)
+		}
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -276,10 +513,47 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			mediaType = whatsmeow.MediaVideo
 			mimeType = "video/quicktime"
 
-		// Document types (for any other file type)
+		// Document types
+		case "pdf":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/pdf"
+		case "doc":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/msword"
+		case "docx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		case "xls":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-excel"
+		case "xlsx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		case "ppt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.ms-powerpoint"
+		case "pptx":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		case "txt":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/plain"
+		case "csv":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "text/csv"
+		case "zip":
+			mediaType = whatsmeow.MediaDocument
+			mimeType = "application/zip"
+
+		// Any other file type. Sending "application/octet-stream" made WhatsApp
+		// mobile render the attachment as an unnamed .bin file, so look the type
+		// up by extension and only fall back to the generic type if that fails.
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -345,8 +619,14 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
+			// FileName is what WhatsApp actually shows and what the recipient's
+			// download is named; without it the file arrives as "Untitled" or
+			// ".bin". filepath.Base handles both / and \ separators, so a
+			// Windows path keeps its real name too.
+			docName := filepath.Base(mediaPath)
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(docName),
+				FileName:      proto.String(docName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -361,6 +641,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		msg.Conversation = proto.String(message)
 	}
 
+	// #121: quote-reply support. A WhatsApp reply is a message that carries a
+	// ContextInfo{StanzaID, Participant} pointing at the original. For group
+	// replies, Participant is required and must be the original sender's JID;
+	// for direct chats it can be omitted. Building ExtendedTextMessage is
+	// necessary because Conversation cannot carry ContextInfo.
+	if replyToMessageID != "" {
+		ctxInfo := &waProto.ContextInfo{StanzaID: proto.String(replyToMessageID)}
+		if replyToSenderJID != "" {
+			ctxInfo.Participant = proto.String(replyToSenderJID)
+		}
+		if msg.ExtendedTextMessage != nil {
+			msg.ExtendedTextMessage.ContextInfo = ctxInfo
+		} else if msg.ImageMessage != nil {
+			msg.ImageMessage.ContextInfo = ctxInfo
+		} else if msg.VideoMessage != nil {
+			msg.VideoMessage.ContextInfo = ctxInfo
+		} else if msg.AudioMessage != nil {
+			msg.AudioMessage.ContextInfo = ctxInfo
+		} else if msg.DocumentMessage != nil {
+			msg.DocumentMessage.ContextInfo = ctxInfo
+		} else {
+			// Plain text - upgrade Conversation to ExtendedTextMessage so it
+			// can carry ContextInfo.
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: ctxInfo,
+			}
+			msg.Conversation = nil
+		}
+	}
+
 	// Send message
 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
 
@@ -373,6 +684,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+	// Same envelopes as in extractTextContent: a document sent with a caption
+	// arrives as DocumentWithCaptionMessage, and without unwrapping it would be
+	// stored as a message with no attachment at all.
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
@@ -426,11 +741,44 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Edits (and some other updates) can arrive as an opaque
+	// secretEncryptedMessage envelope rather than as EditedMessage or
+	// ProtocolMessage. Decrypt it and re-extract from the inner message.
+	// msg.IsEdit is set by whatsmeow when the payload was an edit.
+	if content == "" && msg.Message.GetSecretEncryptedMessage() != nil {
+		if inner, err := client.DecryptSecretEncryptedMessage(context.Background(), msg); err != nil {
+			logger.Warnf("Failed to decrypt secretEncryptedMessage %s: %v", msg.Info.ID, err)
+		} else if decrypted := extractTextContent(inner); decrypted != "" {
+			if msg.IsEdit {
+				content = fmt.Sprintf("[edited] %s", decrypted)
+			} else {
+				content = decrypted
+			}
+		}
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media.
+	//
+	// This gate is where unhandled message types disappear, and it used to do so
+	// invisibly: the "→"/"←" log line below only prints for messages that get
+	// stored, so a type extractTextContent does not understand left no trace at
+	// all. Log the populated proto fields before returning, so an unrecognised
+	// type is discoverable instead of silently lost.
 	if content == "" && mediaType == "" {
+		if msg.Message != nil {
+			var fields []string
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+				fields = append(fields, string(fd.Name()))
+				return true
+			})
+			if len(fields) > 0 {
+				logger.Warnf("Dropping message %s in %s: no text or media extracted. Populated fields: %s",
+					msg.Info.ID, chatJID, strings.Join(fields, ", "))
+			}
+		}
 		return
 	}
 
@@ -590,8 +938,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file.
+	//
+	// The stored filename comes from time.Now() at processing time, not from the
+	// message itself. During history sync dozens of messages are processed
+	// within the same second and all get the same "audio_<ts>.ogg" name; since
+	// the cache check below returns the file whenever it exists, every audio in
+	// a chat would resolve to whichever one was downloaded first. Key the path
+	// on the message ID, which is unique per message.
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, messageID, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -640,10 +995,29 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	// The stored URL is signed and expires; URLs that arrive through history
+	// sync are often already invalid by the time anyone asks for the file. The
+	// direct path does not expire — whatsmeow re-signs a fresh URL from it — so
+	// try that first and only fall back to Download(), which prefers the stored
+	// URL.
+	ctx := context.Background()
+	var mediaData []byte
+
+	if strings.HasPrefix(directPath, "/") {
+		mediaData, err = client.DownloadMediaWithPath(
+			ctx, directPath, fileEncSHA256, fileSHA256, mediaKey, waMediaType, "", false,
+		)
+	} else {
+		err = fmt.Errorf("no usable direct path")
+	}
+
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		var fallbackErr error
+		mediaData, fallbackErr = client.Download(ctx, downloader)
+		if fallbackErr != nil {
+			return false, "", "", "", fmt.Errorf(
+				"failed to download media: via direct path: %v; via url: %v", err, fallbackErr)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -666,13 +1040,12 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query string. It carries the CDN's authentication parameters
+	// (ccb/oh/oe/_nc_sid/mms3), and whatsmeow builds the final URL by appending
+	// "&hash=..." directly to the direct path (see download.go), so it expects
+	// the query to already be there. Stripping it yields a URL with no "?" and a
+	// dangling "&", which the CDN rejects with 403.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -705,8 +1078,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (with optional reply-to context per #121)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToMessageID, req.ReplyToSenderJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -774,8 +1147,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server. Bind to loopback only — the REST API has no auth and
+	// will send WhatsApp messages from the linked account on behalf of any caller.
+	// Binding to all interfaces (":port") would expose send/read to anyone on the
+	// same LAN (home WiFi, café, hotel), so we restrict to 127.0.0.1. The MCP
+	// server connects via http://localhost:{port} (whatsapp-mcp-server/whatsapp.py),
+	// which works unchanged. To opt into LAN exposure, set BIND_ADDR=0.0.0.0.
+	bindAddr := os.Getenv("BIND_ADDR")
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddr, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +1182,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -927,8 +1309,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && existingName != jid.User {
+		// Chat already has a resolved name (not a bare JID/LID fallback), reuse it.
+		// Names equal to jid.User are stale fallbacks and get re-resolved below.
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -973,7 +1356,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,14 +1370,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
+		// Prefer the richest display name available. LID-based chats
+		// ("<id>@lid") typically have an empty FullName but a populated
+		// PushName, so fall back through the available name fields before
+		// using the raw JID, which otherwise surfaces as a bare number.
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+		switch {
+		case err == nil && contact.FullName != "":
 			name = contact.FullName
-		} else if sender != "" {
+		case err == nil && contact.PushName != "":
+			name = contact.PushName
+		case err == nil && contact.BusinessName != "":
+			name = contact.BusinessName
+		case sender != "":
 			// Fallback to sender
 			name = sender
-		} else {
+		default:
 			// Last fallback to JID
 			name = jid.User
 		}
@@ -1053,15 +1444,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Extract text content through the same path as live messages.
+				// Duplicating the extraction here meant captions and non-text
+				// messages were dropped only for history-synced messages, which
+				// is the harder half of the bug to notice.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string

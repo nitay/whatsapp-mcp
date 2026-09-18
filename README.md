@@ -136,7 +136,7 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_contact_chats**: List all chats involving a specific contact
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
-- **send_message**: Send a WhatsApp message to a specified phone number or group JID
+- **send_message**: Send a WhatsApp message to a specified phone number or group JID, optionally quote-replying to an existing message (`reply_to_message_id`, plus `reply_to_sender_jid` for group replies)
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
@@ -158,6 +158,15 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+### Bridge Configuration
+
+The Go bridge reads two optional environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BIND_ADDR` | `127.0.0.1` | Interface the REST API listens on. The API has no authentication and can send messages from your linked account, so it is loopback-only by default. Set to `0.0.0.0` only if you deliberately want to expose it on your LAN. |
+| `WHATSAPP_MEDIA_ROOTS` | unset | Path-separator-delimited allowlist of directories that `send_file` / `send_audio_message` may read from. When unset, any readable absolute path is accepted (paths containing `..` are rejected either way). |
 
 ## Technical Details
 
